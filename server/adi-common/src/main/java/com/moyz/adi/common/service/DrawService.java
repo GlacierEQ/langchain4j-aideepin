@@ -1,0 +1,721 @@
+package com.moyz.adi.common.service;
+
+import cn.hutool.core.img.Img;
+import cn.hutool.core.io.FileUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+import com.moyz.adi.common.base.ThreadContext;
+import com.moyz.adi.common.config.AdiProperties;
+import com.moyz.adi.common.cosntant.RedisKeyConstant;
+import com.moyz.adi.common.dto.*;
+import com.moyz.adi.common.entity.*;
+import com.moyz.adi.common.enums.ErrorEnum;
+import com.moyz.adi.common.exception.BaseException;
+import com.moyz.adi.common.helper.ImageModelContext;
+import com.moyz.adi.common.helper.QuotaHelper;
+import com.moyz.adi.common.helper.RateLimitHelper;
+import com.moyz.adi.common.languagemodel.AbstractImageModelService;
+import com.moyz.adi.common.mapper.DrawMapper;
+import com.moyz.adi.common.util.LocalCache;
+import com.moyz.adi.common.util.LocalDateTimeUtil;
+import com.moyz.adi.common.util.PrivilegeUtil;
+import com.moyz.adi.common.util.UuidUtil;
+import com.moyz.adi.common.util.NumberUtil;
+import jakarta.annotation.Resource;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.util.Strings;
+import org.springframework.beans.BeanUtils;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.awt.*;
+import java.text.MessageFormat;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+import static com.moyz.adi.common.cosntant.AdiConstant.GenerateImage.*;
+import static com.moyz.adi.common.cosntant.AdiConstant.MP_LIMIT_1;
+import static com.moyz.adi.common.enums.ErrorEnum.*;
+import static com.moyz.adi.common.util.LocalCache.MODEL_ID_TO_OBJ;
+
+@Slf4j
+@Service
+public class DrawService extends ServiceImpl<DrawMapper, Draw> {
+
+    @Resource
+    @Lazy
+    private DrawService self;
+
+    @Resource
+    private AdiProperties adiProperties;
+
+    @Resource
+    private QuotaHelper quotaHelper;
+
+    @Resource
+    private RateLimitHelper rateLimitHelper;
+
+    @Resource
+    private UserDayCostService userDayCostService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private FileService fileService;
+
+    @Resource
+    private AiModelService aiModelService;
+
+    @Resource
+    private DrawStarService drawStarService;
+
+    @Resource
+    private DrawCommentService drawCommentService;
+
+    @Resource
+    private UserService userService;
+
+    @Resource
+    private FileGcService fileGcService;
+
+    public void check() {
+        User user = ThreadContext.getCurrentUser();
+        String askingKey = MessageFormat.format(RedisKeyConstant.USER_DRAWING, user.getId());
+        String askingVal = stringRedisTemplate.opsForValue().get(askingKey);
+        //check 1: still waiting response
+        if (StringUtils.isNotBlank(askingVal)) {
+            throw new BaseException(A_DRAWING);
+        }
+
+        String requestTimesKey = MessageFormat.format(RedisKeyConstant.USER_REQUEST_TEXT_TIMES, user.getId());
+        if (!rateLimitHelper.checkRequestTimes(requestTimesKey, LocalCache.TEXT_RATE_LIMIT_CONFIG)) {
+            throw new BaseException(A_REQUEST_TOO_MUCH);
+        }
+        ErrorEnum errorEnum = quotaHelper.checkImageQuota(user, false);
+        if (null != errorEnum) {
+            throw new BaseException(errorEnum);
+        }
+    }
+
+    /**
+     * interacting method 1: Creates an image given a prompt
+     *
+     * @param generateImageReq 文生图请求参数
+     */
+    public String createByPrompt(GenerateImageReq generateImageReq) {
+        self.check();
+        CreateImageDto createImageDto = new CreateImageDto();
+        BeanUtils.copyProperties(generateImageReq, createImageDto);
+        return self.generate(createImageDto);
+    }
+
+    /**
+     * 根据提示词生成图片
+     *
+     * @param createImageDto
+     * @return
+     */
+    public String generate(CreateImageDto createImageDto) {
+        AiModel aiModel = aiModelService.getByNameOrThrow(createImageDto.getModelName());
+        User user = ThreadContext.getCurrentUser();
+
+        // 计算实际生成数量：取模型限制、用户配额、请求值中的最小值
+        int maxImages = aiModel.getMaxImages();
+        int generateNumber = Math.min(
+                Math.min(createImageDto.getNumber(), maxImages),
+                user.getQuotaByImageDaily()
+        );
+
+        String uuid = UuidUtil.createShort();
+        Draw draw = new Draw();
+        draw.setGenerateSize(createImageDto.getSize());
+        draw.setGenerateQuality(createImageDto.getQuality());
+        draw.setGenerateNumber(generateNumber);
+        draw.setGenerateSeed(createImageDto.getSeed());
+        draw.setUuid(uuid);
+        draw.setAiModelId(aiModel.getId());
+        draw.setAiModelName(createImageDto.getModelName());
+        draw.setUserId(user.getId());
+        draw.setInteractingMethod(createImageDto.getInteractingMethod());
+        draw.setProcessStatus(STATUS_DOING);
+        draw.setPrompt(createImageDto.getPrompt());
+        draw.setNegativePrompt(createImageDto.getNegativePrompt());
+        draw.setOriginalImage(createImageDto.getOriginalImage());
+        draw.setMaskImage(createImageDto.getMaskImage());
+        if (null != createImageDto.getDynamicParams() && !createImageDto.getDynamicParams().isEmpty()) {
+            draw.setDynamicParams(createImageDto.getDynamicParams());
+        }
+        // I2I admission: reference images may only be submitted to models declaring image input
+        // (input_types contains image) and within the model's limit (guards against direct API calls bypassing the UI)
+        List<String> refImageUuids = draw.getRefImageUuids();
+        if (!refImageUuids.isEmpty()
+                && (!Arrays.asList(aiModel.getInputTypes().split(",")).contains("image")
+                || refImageUuids.size() > aiModel.getMaxRefImages())) {
+            throw new BaseException(A_PARAMS_ERROR);
+        }
+        getBaseMapper().insert(draw);
+        Draw obj = this.lambdaQuery().eq(Draw::getUuid, uuid).one();
+        fileService.attachRefs(drawRefUuids(draw));
+        self.createFromRemote(obj, user);
+        return uuid;
+    }
+
+    /**
+     * Regenerate the image that was fail
+     *
+     * @param uuid
+     */
+    public void regenerate(String uuid) {
+        User user = ThreadContext.getCurrentUser();
+        // Re-running the model writes its result back into this row, so the row has to belong to
+        // the caller — same check as del / delGeneratedFile / setDrawPublic in this service. Admins
+        // keep regenerating anyone's failed draw, which is what PrivilegeUtil allows.
+        Draw obj = PrivilegeUtil.checkAndGetByUuid(uuid,
+                this.query().eq("process_status", STATUS_FAIL), B_FIND_IMAGE_404);
+
+        self.createFromRemote(obj, user);
+    }
+
+    /**
+     * 异步生成图片
+     *
+     * @param draw
+     * @param user
+     */
+    @Async("imagesExecutor")
+    public void createFromRemote(Draw draw, User user) {
+        String drawingKey = MessageFormat.format(RedisKeyConstant.USER_DRAWING, user.getId());
+        stringRedisTemplate.opsForValue().set(drawingKey, "1", 30, TimeUnit.SECONDS);
+        long startTime = System.currentTimeMillis();
+
+        try {
+            //Increase the number of the request
+            String requestTimesKey = MessageFormat.format(RedisKeyConstant.USER_REQUEST_TEXT_TIMES, user.getId());
+            rateLimitHelper.increaseRequestTimes(requestTimesKey, LocalCache.IMAGE_RATE_LIMIT_CONFIG);
+
+            AbstractImageModelService imageModelService = ImageModelContext.getOrDefault(draw.getAiModelName());
+            List<String> images = imageModelService.generateImage(user, draw);
+            long genDuration = System.currentTimeMillis() - startTime;
+            List<String> imageUuids = new ArrayList<>();
+            images.forEach(imageUrl -> {
+                AdiFile adiFile = fileService.saveImageFromUrl(user, imageUrl);
+                imageUuids.add(adiFile.getUuid());
+            });
+            String imageUuidsJoin = String.join(",", imageUuids);
+            if (StringUtils.isBlank(imageUuidsJoin)) {
+                updateDrawFail(draw.getId(), "No image generated", genDuration);
+                return;
+            }
+            String respImagesPath = String.join(",", images);
+            updateDrawSuccess(draw.getId(), respImagesPath, imageUuidsJoin, genDuration);
+
+            //Update the cost of current user
+            boolean modelIsFree = imageModelService.getAiModel().getIsFree();
+            UserDayCost userDayCost = userDayCostService.getTodayCost(user, modelIsFree);
+            UserDayCost saveOrUpdateInst = new UserDayCost();
+            if (null == userDayCost) {
+                saveOrUpdateInst.setUserId(user.getId());
+                saveOrUpdateInst.setDay(LocalDateTimeUtil.getToday());
+                saveOrUpdateInst.setDrawTimes(1);
+            } else {
+                saveOrUpdateInst.setId(userDayCost.getId());
+                saveOrUpdateInst.setDrawTimes(userDayCost.getDrawTimes() + 1);
+            }
+            saveOrUpdateInst.setIsFree(modelIsFree);
+            userDayCostService.saveOrUpdate(saveOrUpdateInst);
+        } catch (Exception e) {
+            log.error("createFromRemote error", e);
+            long failDuration = System.currentTimeMillis() - startTime;
+            updateDrawFail(draw.getId(), e.getMessage(), failDuration);
+        } finally {
+            stringRedisTemplate.delete(drawingKey);
+        }
+    }
+
+    public void updateDrawSuccess(Long drawId, String respImagesPath, String localImagesUuid, long durationMs) {
+        Draw updateImage = new Draw();
+        updateImage.setId(drawId);
+        updateImage.setRespImagesPath(respImagesPath);
+        updateImage.setGeneratedImages(localImagesUuid);
+        updateImage.setProcessStatus(STATUS_SUCCESS);
+        updateImage.setDuration(NumberUtil.saturatedCastToInt(durationMs));
+        getBaseMapper().updateById(updateImage);
+
+        if (StringUtils.isBlank(localImagesUuid)) {
+            return;
+        }
+        fileService.attachRefs(Arrays.asList(localImagesUuid.split(",")));
+    }
+
+    public void updateDrawFail(Long drawId, String failMsg, long durationMs) {
+        Draw updateImage = new Draw();
+        updateImage.setId(drawId);
+        updateImage.setProcessStatus(STATUS_FAIL);
+        updateImage.setProcessStatusRemark(failMsg);
+        updateImage.setDuration(NumberUtil.saturatedCastToInt(durationMs));
+        getBaseMapper().updateById(updateImage);
+    }
+
+    public DrawListResp listByCurrentUser(Long maxId, int pageSize) {
+        List<Draw> list = this.lambdaQuery()
+                .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                .eq(Draw::getIsDeleted, false)
+                .lt(Draw::getId, maxId)
+                .orderByDesc(Draw::getId)
+                .last("limit " + pageSize)
+                .list();
+        list.sort(Comparator.comparing(Draw::getId));
+        DrawListResp listResp = drawsToListResp(list);
+        listResp.getDraws().forEach(item -> item.setIsStar(drawStarService.isStarred(item.getId(), ThreadContext.getCurrentUserId())));
+        return listResp;
+    }
+
+    /**
+     * 倒序查询公开的图片
+     *
+     * @param maxId    最大的ID
+     * @param pageSize 每次请示获取的数量
+     * @return 图片列表
+     */
+    public DrawListResp listPublic(Long maxId, int pageSize) {
+        List<Draw> list = this.lambdaQuery()
+                .eq(Draw::getIsDeleted, false)
+                .eq(Draw::getIsPublic, true)
+                .lt(Draw::getId, maxId)
+                .orderByDesc(Draw::getId)
+                .last("limit " + pageSize)
+                .list();
+        DrawListResp listResp = drawsToListResp(list);
+        if (StringUtils.isNotBlank(ThreadContext.getToken())) {
+            listResp.getDraws().forEach(item -> item.setIsStar(drawStarService.isStarred(item.getId(), ThreadContext.getCurrentUserId())));
+        }
+        return listResp;
+    }
+
+    public DrawListResp listStarred(Long maxId, int pageSize) {
+        List<DrawStar> stars = drawStarService.listByCurrentUser(maxId, pageSize);
+        if (CollectionUtils.isEmpty(stars)) {
+            DrawListResp resp = new DrawListResp();
+            resp.setDraws(Collections.emptyList());
+            resp.setMinId(Long.MAX_VALUE);
+            return resp;
+        }
+        List<Draw> list = this.lambdaQuery()
+                .in(Draw::getId, stars.stream().map(DrawStar::getDrawId).toList())
+                .list();
+        DrawListResp listResp = drawsToListResp(list);
+        listResp.getDraws().forEach(item -> item.setIsStar(true));
+        return listResp;
+    }
+
+    private DrawListResp drawsToListResp(List<Draw> draws) {
+        List<DrawDto> dtoList = new ArrayList<>();
+        draws.forEach(item -> dtoList.add(convertDrawToDto(item)));
+        DrawListResp result = new DrawListResp();
+        result.setDraws(dtoList);
+        result.setMinId(draws.stream().map(Draw::getId).reduce(Long.MAX_VALUE, Long::min));
+        return result;
+    }
+
+    public DrawDto getOrThrow(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                .one();
+        if (null == draw) {
+            throw new BaseException(A_DATA_NOT_FOUND);
+        }
+        return convertDrawToDto(draw);
+    }
+
+    public Draw getEntityOrThrow(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .one();
+        if (null == draw) {
+            throw new BaseException(A_DATA_NOT_FOUND);
+        }
+        return draw;
+    }
+
+    public DrawDto getPublicOrMine(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .oneOpt()
+                .orElse(null);
+//Public images or own images can be retrieved
+        //公开的图片或者自己的图片，都可以获取到
+        if (
+                null != draw
+                && (draw.getIsPublic() || (ThreadContext.isLogin() && ThreadContext.getCurrentUserId().equals(draw.getUserId())))
+        ) {
+            return convertDrawToDto(draw);
+        } else {
+            return null;
+        }
+    }
+
+    public DrawDto newerPublicOne(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .eq(Draw::getIsPublic, true)
+                .oneOpt()
+                .orElse(null);
+//Public images or own images can be retrieved
+        //公开的图片或者自己的图片，都可以获取到
+        if (null != draw) {
+            draw = this.lambdaQuery()
+                    .gt(Draw::getId, draw.getId())
+                    .eq(Draw::getIsDeleted, false)
+                    .eq(Draw::getIsPublic, true)
+                    .last(MP_LIMIT_1)
+                    .orderByAsc(Draw::getId).one();
+            if (null != draw) {
+                return convertDrawToDto(draw);
+            }
+        }
+        return null;
+    }
+
+    public DrawDto olderPublicOne(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .eq(Draw::getIsPublic, true)
+                .oneOpt()
+                .orElse(null);
+//Public images or own images can be retrieved
+        //公开的图片或者自己的图片，都可以获取到
+        if (null != draw) {
+            draw = this.lambdaQuery()
+                    .lt(Draw::getId, draw.getId())
+                    .eq(Draw::getIsDeleted, false)
+                    .eq(Draw::getIsPublic, true)
+                    .last(MP_LIMIT_1)
+                    .orderByDesc(Draw::getId).one();
+            if (null != draw) {
+                return convertDrawToDto(draw);
+            }
+        }
+        return null;
+    }
+
+    public DrawDto newerStarredOne(String uuid) {
+        return adjacentStarredOne(uuid, true);
+    }
+
+    public DrawDto olderStarredOne(String uuid) {
+        return adjacentStarredOne(uuid, false);
+    }
+
+    /**
+     * Neighbour of the given draw inside the caller's own favorites, ordered by the moment the
+     * caller starred them. Two things have to hold: the neighbour is looked up among the caller's
+     * stars (not the draw owner's), and "newer"/"older" walk in the two opposite directions —
+     * forward reads the smallest update time above the current one, backward the largest below it.
+     * The draw returned is the one the neighbouring star points at, not some other draw with a
+     * bigger id. Missing neighbours yield null, which the UI treats as "end of the list".
+     * <p>
+     * 取当前用户收藏夹里这张图的前一张/后一张：范围必须是「我的收藏」（不是图片所有者的收藏），
+     * 方向必须相反（向后取比当前更晚一条里最早的，向前取比当前更早一条里最晚的），
+     * 返回的是那条收藏所指向的图，而不是 id 更大的任意图。没有相邻项时返回 null。
+     */
+    private DrawDto adjacentStarredOne(String uuid, boolean newer) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .oneOpt()
+                .orElse(null);
+        if (null == draw) {
+            return null;
+        }
+        Long currentUserId = ThreadContext.getCurrentUserId();
+        DrawStar currentStar = drawStarService.lambdaQuery()
+                .eq(DrawStar::getUserId, currentUserId)
+                .eq(DrawStar::getDrawId, draw.getId())
+                .eq(DrawStar::getIsDeleted, false)
+                .one();
+        if (null == currentStar) {
+            return null;
+        }
+        DrawStar neighbourStar = drawStarService.lambdaQuery()
+                .eq(DrawStar::getUserId, currentUserId)
+                .eq(DrawStar::getIsDeleted, false)
+                .gt(newer, DrawStar::getUpdateTime, currentStar.getUpdateTime())
+                .lt(!newer, DrawStar::getUpdateTime, currentStar.getUpdateTime())
+                .orderByAsc(newer, DrawStar::getUpdateTime)
+                .orderByDesc(!newer, DrawStar::getUpdateTime)
+                .last(MP_LIMIT_1)
+                .one();
+        if (null == neighbourStar) {
+            return null;
+        }
+        Draw neighbour = this.lambdaQuery()
+                .eq(Draw::getId, neighbourStar.getDrawId())
+                .eq(Draw::getIsDeleted, false)
+                .oneOpt()
+                .orElse(null);
+        return null == neighbour ? null : convertDrawToDto(neighbour);
+    }
+
+    public DrawDto newerMine(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                .oneOpt()
+                .orElse(null);
+//Public images or own images can be retrieved
+        //公开的图片或者自己的图片，都可以获取到
+        if (null != draw) {
+            draw = this.lambdaQuery()
+                    .gt(Draw::getId, draw.getId())
+                    .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                    .eq(Draw::getIsDeleted, false)
+                    .last(MP_LIMIT_1)
+                    .orderByAsc(Draw::getId)
+                    .one();
+            if (null != draw) {
+                return convertDrawToDto(draw);
+            }
+        }
+        return null;
+    }
+
+    public DrawDto olderMine(String uuid) {
+        Draw draw = this.lambdaQuery()
+                .eq(Draw::getUuid, uuid)
+                .eq(Draw::getIsDeleted, false)
+                .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                .oneOpt()
+                .orElse(null);
+//Public images or own images can be retrieved
+        //公开的图片或者自己的图片，都可以获取到
+        if (null != draw) {
+            draw = this.lambdaQuery()
+                    .lt(Draw::getId, draw.getId())
+                    .eq(Draw::getIsDeleted, false)
+                    .eq(Draw::getUserId, ThreadContext.getCurrentUserId())
+                    .last(MP_LIMIT_1)
+                    .orderByDesc(Draw::getId)
+                    .one();
+            if (null != draw) {
+                return convertDrawToDto(draw);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 删除做图记录
+     *
+     * @param uuid 绘图任务uuid
+     * @return 是否删除成功
+     */
+    public boolean del(String uuid) {
+        Draw draw = PrivilegeUtil.checkAndGetByUuid(uuid, this.query(), A_AI_IMAGE_NOT_FOUND);
+        fileService.detachRefs(drawRefUuids(draw));
+        self.softDel(draw.getId());
+        fileGcService.reclaimUnreferenced(generatedImageUuids(draw));
+        return true;
+    }
+
+    /**
+     * 画图记录引用的输入侧文件 uuid（参考图/原图/蒙版）；生成图引用在生成成功时登记一次，
+     * 随删除的引用重算回收释放，不走 detach。
+     * <p>
+     * Input-side file uuids referenced by a draw record (reference images / original / mask);
+     * generated-image references are attached once on success and released by recount-based
+     * reclamation on removal, never through detach.
+     * </p>
+     */
+    private List<String> drawRefUuids(Draw draw) {
+        List<String> uuids = new ArrayList<>(draw.getRefImageUuids());
+        if (StringUtils.isNotBlank(draw.getOriginalImage())) {
+            uuids.add(draw.getOriginalImage());
+        }
+        if (StringUtils.isNotBlank(draw.getMaskImage())) {
+            uuids.add(draw.getMaskImage());
+        }
+        return uuids;
+    }
+
+    /**
+     * draw 行 generated_images 的 uuid 列表；空串返回空列表。
+     * <p>
+     * Uuid list parsed from the draw row's generated_images; a blank value yields an empty list.
+     * </p>
+     */
+    private List<String> generatedImageUuids(Draw draw) {
+        if (StringUtils.isBlank(draw.getGeneratedImages())) {
+            return new ArrayList<>();
+        }
+        return new ArrayList<>(Arrays.asList(draw.getGeneratedImages().split(",")));
+    }
+
+    /**
+     * 删除做图任务中的一张图片
+     *
+     * @param uuid               adi_draw uuid
+     * @param generatedImageUuid 图片uuid
+     * @return 是否成功
+     */
+    public boolean delGeneratedFile(String uuid, String generatedImageUuid) {
+        Draw draw = PrivilegeUtil.checkAndGetByUuid(uuid, this.query(), A_AI_IMAGE_NOT_FOUND);
+        List<String> uuids = generatedImageUuids(draw);
+        if (uuids.isEmpty()) {
+            return false;
+        }
+        boolean removed = uuids.removeIf(fileUuid -> fileUuid.equals(generatedImageUuid));
+        String remainFiles = uuids.stream()
+                .filter(StringUtils::isNotBlank)
+                .collect(Collectors.joining(","));
+        self.lambdaUpdate().eq(Draw::getId, draw.getId()).set(Draw::getGeneratedImages, remainFiles).update();
+        if (removed) {
+            fileGcService.reclaimUnreferenced(List.of(generatedImageUuid));
+        }
+        return true;
+    }
+
+    private DrawDto convertDrawToDto(Draw draw) {
+        DrawDto dto = new DrawDto();
+        BeanUtils.copyProperties(draw, dto);
+
+        String aiPlatformName = "";
+        if (null != MODEL_ID_TO_OBJ.get(draw.getAiModelId())) {
+            aiPlatformName = MODEL_ID_TO_OBJ.get(draw.getAiModelId()).getPlatform();
+        }
+        dto.setAiModelPlatform(aiPlatformName);
+        //Image uuid string to uuid list
+        List<String> images = new ArrayList<>();
+        if (StringUtils.isNotBlank(dto.getGeneratedImages())) {
+            String[] imageUuids = dto.getGeneratedImages().split(",");
+            images.addAll(Arrays.asList(imageUuids));
+        }
+        dto.setImageUuids(images);
+        dto.setImageUrls(fileService.getUrls(images));
+
+        dto.setOriginalImageUuid(StringUtils.defaultString(draw.getOriginalImage(), Strings.EMPTY));
+        String originalUrl = fileService.getUrl(draw.getOriginalImage());
+        dto.setOriginalImageUrl(StringUtils.defaultString(originalUrl, Strings.EMPTY));
+
+        dto.setMaskImageUuid(StringUtils.defaultString(draw.getMaskImage(), Strings.EMPTY));
+        String maskUrl = fileService.getUrl(draw.getMaskImage());
+        dto.setMaskImageUrl(StringUtils.defaultString(maskUrl, Strings.EMPTY));
+        // isStar describes the viewer, not the draw's owner: for a public draw of another user
+        // dto.getUserId() is that owner, so reading the flag against it reports the owner's
+        // favorite state. The list endpoints (listByCurrentUser / listPublic / listStarred)
+        // already recompute the flag for the current user; the detail endpoints get it from here.
+        // isStar 描述的是「当前查看者」，不是图片所有者。
+        boolean isStarred = ThreadContext.isLogin()
+                && drawStarService.isStarred(draw.getId(), ThreadContext.getCurrentUserId());
+        dto.setIsStar(isStarred);
+
+        //User
+        User user = userService.getByUserId(dto.getUserId());
+        if (null != user) {
+            dto.setUserUuid(user.getUuid());
+            dto.setUserName(user.getName());
+        }
+        return dto;
+    }
+
+    private void softDel(Long id) {
+        log.info("Soft delete draw, id:{}", id);
+        this.lambdaUpdate().eq(Draw::getId, id).set(Draw::getIsDeleted, true).update();
+    }
+
+    public int sumTodayCost() {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime begin = LocalDateTime.of(now.getYear(), now.getMonth(), now.getDayOfMonth(), 0, 0);
+        LocalDateTime end = LocalDateTime.of(now.getYear(), now.getMonth(), now.getDayOfMonth(), 23, 59, 59);
+        return this.lambdaQuery()
+                .between(Draw::getCreateTime, begin, end)
+                .eq(Draw::getIsDeleted, false)
+                .count()
+                .intValue();
+    }
+
+    public int sumCurrMonthCost() {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime begin = LocalDateTime.of(now.getYear(), now.getMonth(), 1, 0, 0);
+        LocalDateTime end = LocalDateTime.of(now.getYear(), now.getMonth(), 1, 23, 59, 59).plusMonths(1).minusDays(1);
+        return this.lambdaQuery()
+                .between(Draw::getCreateTime, begin, end)
+                .eq(Draw::getIsDeleted, false)
+                .count()
+                .intValue();
+    }
+
+    public DrawDto setDrawPublic(String uuid, Boolean isPublic, Boolean withWatermark) {
+        Draw draw = PrivilegeUtil.checkAndGetByUuid(uuid, this.query(), A_AI_IMAGE_NOT_FOUND);
+        //生成水印
+        if (BooleanUtils.isTrue(withWatermark)) {
+            AdiFile adiFile = fileService.getFile(uuid);
+            String markImagePath = fileService.getWatermarkImagesPath(adiFile);
+            if (!FileUtil.exist(markImagePath)) {
+                Img.from(FileUtil.file(adiFile.getPath())).setPositionBaseCentre(false).pressText(
+                        ThreadContext.getCurrentUser().getName() + "|" + adiProperties.getHost(), Color.WHITE,
+                        null,
+                        0,
+                        0,
+                        0.4f);
+            }
+        }
+        this.lambdaUpdate()
+                .eq(Draw::getId, draw.getId())
+                .set(Draw::getIsPublic, isPublic)
+                .set(BooleanUtils.isTrue(withWatermark), Draw::getWithWatermark, withWatermark)
+                .update();
+        return getOrThrow(uuid);
+    }
+
+    public DrawDto toggleStar(String uuid) {
+        // Favoriting is a read-then-write on the draw row, so it follows the read rule: the owner,
+        // or anyone when the draw is public. This is the rule KnowledgeBaseService#toggleStar
+        // applies (owner or public), and what the gallery star button needs: with an owner-only
+        // lookup, starring another user's public image fails with NOT_FOUND and the button is dead.
+        // 收藏是对该行 draw 的读后写，因此按读权限判定：所有者，或（公开图时）任何用户。
+        // 与知识库收藏一致；若按所有者取行，画廊里收藏别人的公开图会直接报 NOT_FOUND。
+        DrawDto draw = getPublicOrMine(uuid);
+        if (null == draw) {
+            throw new BaseException(A_AI_IMAGE_NOT_FOUND);
+        }
+        drawStarService.toggle(draw.getId(), ThreadContext.getCurrentUserId());
+
+        //Calculate stars
+        boolean starred = drawStarService.isStarred(draw.getId(), ThreadContext.getCurrentUserId());
+        int stars = draw.getStarCount() + (starred ? 1 : -1);
+        this.lambdaUpdate()
+                .eq(Draw::getId, draw.getId())
+                .set(Draw::getStarCount, stars)
+                .update();
+        draw.setStarCount(stars);
+        draw.setIsStar(starred);
+        return draw;
+    }
+
+    public DrawCommentDto addComment(String drawUuid, String remark) {
+        Draw draw = getEntityOrThrow(drawUuid);
+        return drawCommentService.add(ThreadContext.getCurrentUser(), draw, remark);
+    }
+
+    public Page<DrawCommentDto> listCommentsByPage(String drawUuid, Integer currentPage, Integer pageSize) {
+        Draw draw = getEntityOrThrow(drawUuid);
+        Page<DrawCommentDto> commentDtoPage = drawCommentService.listByPage(draw.getId(), currentPage, pageSize);
+        commentDtoPage.getRecords().forEach(item -> item.setDrawUuid(drawUuid));
+        return commentDtoPage;
+    }
+}

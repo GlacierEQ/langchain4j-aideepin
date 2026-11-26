@@ -1,0 +1,441 @@
+package com.moyz.adi.common.service;
+
+import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+import com.moyz.adi.common.base.ThreadContext;
+import com.moyz.adi.common.entity.AdiFile;
+import com.moyz.adi.common.entity.User;
+import com.moyz.adi.common.enums.ErrorEnum;
+import com.moyz.adi.common.exception.BaseException;
+import com.moyz.adi.common.file.FileOperatorContext;
+import com.moyz.adi.common.file.LocalFileUtil;
+import com.moyz.adi.common.cosntant.AdiConstant;
+import com.moyz.adi.common.mapper.FileMapper;
+import com.moyz.adi.common.util.HashUtil;
+import com.moyz.adi.common.util.UuidUtil;
+import com.moyz.adi.common.vo.SaveRemoteImageResult;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+import static com.moyz.adi.common.enums.ErrorEnum.A_AI_IMAGE_NO_AUTH;
+import static com.moyz.adi.common.enums.ErrorEnum.A_FILE_NOT_EXIST;
+import static com.moyz.adi.common.enums.ErrorEnum.A_UPLOAD_FILE_TYPE_NOT_ALLOWED;
+import static com.moyz.adi.common.enums.ErrorEnum.A_UPLOAD_IMAGE_TYPE_NOT_ALLOWED;
+
+@Slf4j
+@Service
+public class FileService extends ServiceImpl<FileMapper, AdiFile> {
+
+    @Value("${local.images}")
+    private String imagePath;
+
+    @Value("${local.watermark-images}")
+    private String watermarkImagesPath;
+
+    @Value("${local.thumbnails}")
+    private String thumbnailsPath;
+
+    @Value("${local.watermark-thumbnails}")
+    private String watermarkThumbnailsPath;
+
+    @Value("${local.files}")
+    private String filePath;
+
+    @Value("${local.tmp-images}")
+    private String tmpImagesPath;
+
+    private static final List<String> BINARY_EXTENSIONS = List.of(
+// Executable/Binary
+            // 可执行/二进制
+            "exe", "dll", "so", "dylib", "com", "msi",
+            "jar", "war", "ear", "class",
+            "iso", "dmg", "bin", "apk", "ipa", "deb", "rpm",
+// Archive file
+            // 压缩包
+            "zip", "rar", "7z", "tar", "gz", "bz2",
+            // 视频
+            "mp4", "avi", "mov", "wmv", "flv", "mkv", "webm", "m4v", "mpeg", "3gp"
+    );
+
+    /**
+     * Persist an uploaded file (sha256-deduplicated) and return its record.
+     * With local storage the multipart temp file may be moved away (transferTo):
+     * finish all multipart stream reads before calling this.
+     */
+    public AdiFile saveFile(MultipartFile file, boolean image) {
+        String originalFilename = file.getOriginalFilename();
+        if (StringUtils.isBlank(originalFilename) || !originalFilename.contains(".")) {
+            throw new BaseException(A_UPLOAD_FILE_TYPE_NOT_ALLOWED);
+        }
+        String ext = originalFilename.substring(originalFilename.lastIndexOf('.') + 1).toLowerCase();
+        if (BINARY_EXTENSIONS.contains(ext)) {
+            throw new BaseException(A_UPLOAD_FILE_TYPE_NOT_ALLOWED);
+        }
+        if (image && !AdiConstant.IMAGE_EXTENSIONS.contains(ext)) {
+            throw new BaseException(A_UPLOAD_IMAGE_TYPE_NOT_ALLOWED);
+        }
+        String sha256 = HashUtil.sha256(file);
+        Optional<AdiFile> existFile = this.lambdaQuery()
+                .eq(AdiFile::getSha256, sha256)
+                .eq(AdiFile::getUserId, ThreadContext.getCurrentUserId())
+                .eq(AdiFile::getIsDeleted, false)
+                .last("limit 1")
+                .oneOpt();
+        if (existFile.isEmpty()) {
+            existFile = this.lambdaQuery()
+                    .eq(AdiFile::getSha256, sha256)
+                    .eq(AdiFile::getIsDeleted, false)
+                    .last("limit 1")
+                    .oneOpt();
+        }
+        if (existFile.isPresent()) {
+            AdiFile adiFile = existFile.get();
+            boolean exist = FileOperatorContext.checkIfExist(adiFile);
+            if (exist) {
+                if (Objects.equals(adiFile.getUserId(), ThreadContext.getCurrentUserId())) {
+                    return adiFile;
+                }
+                return insertSharedRow(file, adiFile, sha256);
+            } else {
+                log.warn("File not found, deleting record for regeneration, fileId:{}, uuid:{}, sha256:{}", adiFile.getId(), adiFile.getUuid(), adiFile.getSha256());
+                this.lambdaUpdate().eq(AdiFile::getId, adiFile.getId()).set(AdiFile::getIsDeleted, true).update();
+            }
+        }
+        String uuid = UuidUtil.createShort();
+        Pair<String, String> originalFile = new FileOperatorContext().save(file, image, uuid);
+        AdiFile adiFile = new AdiFile();
+        adiFile.setName(file.getOriginalFilename());
+        adiFile.setUuid(uuid);
+        adiFile.setSha256(sha256);
+        adiFile.setPath(originalFile.getLeft());
+        adiFile.setExt(originalFile.getRight());
+        adiFile.setUserId(ThreadContext.getCurrentUserId());
+        adiFile.setStorageLocation(FileOperatorContext.getStorageLocation());
+        this.getBaseMapper().insert(adiFile);
+        return adiFile;
+    }
+
+    /**
+     * 插入已被他人上传过的文件
+     * <p>
+     * Insert a row for a file that another user has already uploaded.
+     * </p>
+     */
+    private AdiFile insertSharedRow(MultipartFile file, AdiFile existing, String sha256) {
+        String originalFilename = file.getOriginalFilename();
+        AdiFile adiFile = new AdiFile();
+        adiFile.setName(originalFilename);
+        adiFile.setUuid(UuidUtil.createShort());
+        adiFile.setSha256(sha256);
+        adiFile.setPath(existing.getPath());
+        adiFile.setExt(originalFilename.substring(originalFilename.lastIndexOf('.') + 1).toLowerCase());
+        adiFile.setUserId(ThreadContext.getCurrentUserId());
+        adiFile.setStorageLocation(existing.getStorageLocation());
+        this.getBaseMapper().insert(adiFile);
+        return adiFile;
+    }
+
+    public AdiFile saveImageFromUrl(User user, String sourceImageUrl) {
+        log.info("saveImageFromUrl,sourceImageUrl:{}", sourceImageUrl);
+        String uuid = UuidUtil.createShort();
+        SaveRemoteImageResult saveResult = new FileOperatorContext().saveImageFromUrl(sourceImageUrl, uuid);
+        AdiFile adiFile = new AdiFile();
+        adiFile.setName(saveResult.getOriginalName());
+        adiFile.setUuid(uuid);
+        adiFile.setSha256(HashUtil.sha256(saveResult.getPathOrUrl()));
+        adiFile.setPath(saveResult.getPathOrUrl());
+        adiFile.setUserId(user.getId());
+        adiFile.setExt(saveResult.getExt());
+        adiFile.setStorageLocation(FileOperatorContext.getStorageLocation());
+        this.getBaseMapper().insert(adiFile);
+        return adiFile;
+    }
+
+    public AdiFile saveFromPath(User user, String pathOrUrl) {
+        log.info("saveImageFromPath,path:{}", pathOrUrl);
+        Pair<String, String> nameAndExt = LocalFileUtil.getNameAndExt(pathOrUrl);
+        String uuid = UuidUtil.createShort();
+        AdiFile adiFile = new AdiFile();
+        adiFile.setName(nameAndExt.getLeft());
+        adiFile.setUuid(uuid);
+        adiFile.setSha256(HashUtil.sha256(pathOrUrl));
+        adiFile.setPath(pathOrUrl);
+        adiFile.setUserId(user.getId());
+        adiFile.setExt(nameAndExt.getRight());
+        adiFile.setStorageLocation(FileOperatorContext.getStorageLocation());
+        this.getBaseMapper().insert(adiFile);
+        return adiFile;
+    }
+
+    /**
+     * 引用登记的统一入口，ref_count 只在此自增，业务代码不要直接修改计数。
+     * 行已被软删但物理文件未删时，复活该行并计数加一；
+     * 行不存在或物理文件已被删除时，视为失效引用，仅告警，不阻断业务。
+     * <p>
+     * Single entry point for attaching references; ref_count is incremented only here.
+     * A soft-deleted row whose physical file still exists is revived and its count incremented;
+     * a missing row or an already-deleted file only warns.
+     * </p>
+     */
+    public void attachRef(String uuid) {
+        if (StringUtils.isBlank(uuid)) {
+            return;
+        }
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .last("limit 1")
+                .oneOpt()
+                .orElse(null);
+        if (null == adiFile) {
+            log.warn("Attach reference to a missing file, uuid:{}", uuid);
+            return;
+        }
+        if (null != adiFile.getIsDeleted() && adiFile.getIsDeleted()) {
+            if (!FileOperatorContext.checkIfExist(adiFile)) {
+                log.warn("Attach reference to a soft-deleted file whose physical file is gone, uuid:{}", uuid);
+                return;
+            }
+            this.lambdaUpdate()
+                    .eq(AdiFile::getId, adiFile.getId())
+                    .set(AdiFile::getIsDeleted, false)
+                    .setSql("ref_count = ref_count + 1")
+                    .update();
+            log.info("Revived soft-deleted file for a new reference, uuid:{}", uuid);
+            return;
+        }
+        this.lambdaUpdate()
+                .eq(AdiFile::getId, adiFile.getId())
+                .setSql("ref_count = ref_count + 1")
+                .update();
+    }
+
+    public void attachRefs(Collection<String> uuids) {
+        if (CollectionUtils.isEmpty(uuids)) {
+            return;
+        }
+        uuids.forEach(this::attachRef);
+    }
+
+    /**
+     * 引用解除收口：业务记录删除（软删即解除）时调用，原子递减且地板为 0；软删行不再计数，视为无引用。
+     * <p>
+     * Single entry point for reference removal: decrements atomically with a floor of 0;
+     * already soft-deleted rows are skipped — a soft-deleted file row counts as unreferenced.
+     * </p>
+     */
+    public void detachRef(String uuid) {
+        if (StringUtils.isBlank(uuid)) {
+            return;
+        }
+        this.lambdaUpdate()
+                .eq(AdiFile::getUuid, uuid)
+                .eq(AdiFile::getIsDeleted, false)
+                .setSql("ref_count = GREATEST(ref_count - 1, 0)")
+                .update();
+    }
+
+    public void detachRefs(Collection<String> uuids) {
+        if (CollectionUtils.isEmpty(uuids)) {
+            return;
+        }
+        log.info("Detach file refs, uuids:{}", uuids);
+        uuids.forEach(this::detachRef);
+    }
+
+    public AdiFile getByUuid(String uuid) {
+        return this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .eq(AdiFile::getUserId, ThreadContext.getCurrentUserId())
+                .oneOpt().orElse(null);
+    }
+
+    /**
+     * 读取图片到BufferedImage，管理员或图片拥有者才有权限查看
+     *
+     * @param uuid      图片uuid
+     * @param thumbnail 读取的是缩略图
+     * @return 图片内容
+     */
+    public BufferedImage readMyImage(String uuid, boolean thumbnail) {
+        if (StringUtils.isBlank(ThreadContext.getToken())) {
+            throw new BaseException(A_AI_IMAGE_NO_AUTH);
+        }
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(!ThreadContext.getCurrentUser().getIsAdmin(), AdiFile::getUserId, ThreadContext.getCurrentUserId())
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(A_FILE_NOT_EXIST);
+        }
+        return LocalFileUtil.readLocalImage(adiFile, thumbnail, thumbnailsPath);
+    }
+
+    public BufferedImage readImage(String uuid, boolean thumbnail) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(A_FILE_NOT_EXIST);
+        }
+        return LocalFileUtil.readLocalImage(adiFile, thumbnail, thumbnailsPath);
+    }
+
+    public String getImagePath(String uuid) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(ErrorEnum.A_AI_IMAGE_NOT_FOUND);
+        }
+        return adiFile.getPath();
+    }
+
+
+    public AdiFile getFile(String uuid) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(ErrorEnum.A_AI_IMAGE_NOT_FOUND);
+        }
+        return adiFile;
+    }
+
+    /**
+     * 读取文件内容字节:本地存储直接读盘;OSS 存储从其可访问 URL 下载。
+     * 供图生图等需要把文件内容提交给模型服务的场景使用。
+     * <p>
+     * Read file bytes: local storage reads from disk; OSS storage downloads from its accessible URL.
+     */
+    public byte[] readFileBytes(String uuid) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(A_FILE_NOT_EXIST);
+        }
+        return readFileBytes(adiFile);
+    }
+
+    public byte[] readFileBytes(AdiFile adiFile) {
+        if (Objects.equals(AdiConstant.STORAGE_LOCATION_VALUE_LOCAL, adiFile.getStorageLocation())) {
+            try {
+                return Files.readAllBytes(Paths.get(adiFile.getPath()));
+            } catch (IOException e) {
+                log.error("Read local file error, path:{}", adiFile.getPath(), e);
+                throw new BaseException(A_FILE_NOT_EXIST);
+            }
+        }
+        String url = FileOperatorContext.getFileUrl(adiFile);
+        try {
+            HttpClient httpClient = HttpClient.newHttpClient();
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url)).GET().build();
+            HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            if (response.statusCode() != 200) {
+                log.error("Download file from url fail, status:{}, url:{}", response.statusCode(), url);
+                throw new BaseException(A_FILE_NOT_EXIST);
+            }
+            return response.body();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new BaseException(A_FILE_NOT_EXIST);
+        } catch (IOException e) {
+            log.error("Download file from url error, url:{}", url, e);
+            throw new BaseException(A_FILE_NOT_EXIST);
+        }
+    }
+
+    public String getTmpImagesPath(String uuid) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(ErrorEnum.A_AI_IMAGE_NOT_FOUND);
+        }
+        return tmpImagesPath + uuid + "." + adiFile.getExt();
+    }
+
+    public String getWatermarkImagesPath(String uuid) {
+        AdiFile adiFile = this.lambdaQuery()
+                .eq(AdiFile::getUuid, uuid)
+                .oneOpt().orElse(null);
+        if (null == adiFile) {
+            throw new BaseException(ErrorEnum.A_AI_IMAGE_NOT_FOUND);
+        }
+        return watermarkImagesPath + uuid + "." + adiFile.getExt();
+    }
+
+    public String getWatermarkImagesPath(AdiFile adiFile) {
+        return watermarkImagesPath + adiFile.getUuid() + "." + adiFile.getExt();
+    }
+
+    /**
+     * 批量取文件url，keyed by 文件uuid（缺失/已删除的文件不产生条目）：
+     * 列表页一次查询回填，替代逐行 getUrl 的 N+1
+     */
+    public Map<String, String> getUrlByUuids(Collection<String> fileUuids) {
+        if (CollectionUtils.isEmpty(fileUuids)) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> result = new HashMap<>();
+        this.lambdaQuery()
+                .in(AdiFile::getUuid, fileUuids)
+                .eq(AdiFile::getIsDeleted, false)
+                .list()
+                .forEach(adiFile -> result.put(adiFile.getUuid(), FileOperatorContext.getFileUrl(adiFile)));
+        return result;
+    }
+
+    public String getUrl(String fileUuid) {
+        if (StringUtils.isBlank(fileUuid)) {
+            return null;
+        }
+        List<String> list = getUrls(List.of(fileUuid));
+        if (!list.isEmpty()) {
+            return list.get(0);
+        }
+        return null;
+    }
+
+    /**
+     * 获取文件url
+     *
+     * @param fileUuids 文件uuid
+     * @return 文件url
+     */
+    public List<String> getUrls(List<String> fileUuids) {
+        if (CollectionUtils.isEmpty(fileUuids)) {
+            return Collections.emptyList();
+        }
+        List<String> result = new ArrayList<>();
+        this.lambdaQuery()
+                .in(AdiFile::getUuid, fileUuids)
+                .eq(AdiFile::getIsDeleted, false)
+                .list()
+                .forEach(adiFile -> {
+                    result.add(FileOperatorContext.getFileUrl(adiFile));
+                });
+        return result;
+    }
+}

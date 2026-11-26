@@ -1,0 +1,208 @@
+package com.moyz.adi.common.service;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+import com.baomidou.mybatisplus.extension.toolkit.ChainWrappers;
+import com.moyz.adi.common.dto.AiModelDto;
+import com.moyz.adi.common.dto.AiModelSearchReq;
+import com.moyz.adi.common.entity.AiModel;
+import com.moyz.adi.common.enums.ErrorEnum;
+import com.moyz.adi.common.enums.ModelHealthStatus;
+import com.moyz.adi.common.exception.BaseException;
+import com.moyz.adi.common.mapper.AiModelMapper;
+import com.moyz.adi.common.util.MPPageUtil;
+import jakarta.annotation.Resource;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.BeanUtils;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@Service
+public class AiModelService extends ServiceImpl<AiModelMapper, AiModel> {
+
+    @Resource
+    private AiModelInitializer aiModelInitializer;
+
+    @Resource
+    private ModelHealthService modelHealthService;
+
+    public void init() {
+        log.info("Initializing AI model...");
+        List<AiModel> aiModels = ChainWrappers.lambdaQueryChain(baseMapper).eq(AiModel::getIsDeleted, false).list();
+        aiModelInitializer.init(aiModels);
+    }
+
+    public List<AiModel> listBy(String platform, String type) {
+        return ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(AiModel::getPlatform, platform)
+                .eq(AiModel::getType, type)
+                .eq(AiModel::getIsDeleted, false)
+                .list();
+    }
+
+    public AiModel getByName(String modelName) {
+        return ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(AiModel::getName, modelName)
+                .eq(AiModel::getIsDeleted, false)
+                .one();
+    }
+
+    public AiModel getByNameOrThrow(String modelName) {
+        AiModel aiModel = ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(AiModel::getName, modelName)
+                .eq(AiModel::getIsDeleted, false)
+                .one();
+        if (null == aiModel) {
+            throw new BaseException(ErrorEnum.A_MODEL_NOT_FOUND);
+        }
+        return aiModel;
+    }
+
+    public Long getIdByName(String modelName) {
+        AiModel aiModel = this.getByName(modelName);
+        return null == aiModel ? 0L : aiModel.getId();
+    }
+
+    public AiModel getByIdOrThrow(Long id) {
+        AiModel existModel = baseMapper.selectById(id);
+        if (null == existModel) {
+            throw new BaseException(ErrorEnum.A_MODEL_NOT_FOUND);
+        }
+        return existModel;
+    }
+
+    public Page<AiModelDto> search(AiModelSearchReq aiModelSearchReq, Integer currentPage, Integer pageSize) {
+        LambdaQueryWrapper<AiModel> lambdaQueryWrapper = new LambdaQueryWrapper<>();
+        if (StringUtils.isNotBlank(aiModelSearchReq.getPlatform())) {
+            lambdaQueryWrapper.eq(AiModel::getPlatform, aiModelSearchReq.getPlatform());
+        }
+        if (StringUtils.isNotBlank(aiModelSearchReq.getType())) {
+            lambdaQueryWrapper.eq(AiModel::getType, aiModelSearchReq.getType());
+        }
+        if (null != aiModelSearchReq.getIsEnable()) {
+            lambdaQueryWrapper.eq(AiModel::getIsEnable, aiModelSearchReq.getIsEnable());
+        }
+        lambdaQueryWrapper.like(StringUtils.isNotBlank(aiModelSearchReq.getName()), AiModel::getName, aiModelSearchReq.getName());
+        lambdaQueryWrapper.eq(AiModel::getIsDeleted, false);
+        lambdaQueryWrapper.orderByDesc(AiModel::getUpdateTime);
+        if (StringUtils.isNotBlank(aiModelSearchReq.getHealthStatus())) {
+            return searchByHealth(lambdaQueryWrapper, aiModelSearchReq.getHealthStatus(), currentPage, pageSize);
+        }
+        Page<AiModel> aiModelPage = baseMapper.selectPage(new Page<>(currentPage, pageSize), lambdaQueryWrapper);
+        return MPPageUtil.convertToPage(aiModelPage, new Page<>(), AiModelDto.class);
+    }
+
+    /**
+     * 健康状态过滤：状态存于内存缓存而非数据库，先查出全部匹配行再内存过滤、手工分页；
+     * 只对启用模型生效，禁用模型在健康列显示「禁用」，不参与健康过滤。
+     * <p>
+     * Health status filter: statuses live in an in-memory cache instead of the database, so all
+     * matching rows are loaded, filtered and paginated in memory; only enabled models take part,
+     * disabled ones show "disabled" in the health column and never match this filter.
+     * </p>
+     */
+    private Page<AiModelDto> searchByHealth(LambdaQueryWrapper<AiModel> lambdaQueryWrapper, String healthStatus, Integer currentPage, Integer pageSize) {
+        Map<String, ModelHealthService.HealthCheckResult> statuses = modelHealthService.getAllStatuses();
+        boolean unhealthy = ModelHealthStatus.UNHEALTHY.name().equals(healthStatus);
+        List<AiModel> matched = baseMapper.selectList(lambdaQueryWrapper).stream()
+                .filter(model -> Boolean.TRUE.equals(model.getIsEnable()))
+                .filter(model -> {
+                    ModelHealthService.HealthCheckResult result = statuses.get(model.getName());
+                    boolean isUnhealthy = null != result && ModelHealthStatus.UNHEALTHY == result.getStatus();
+                    return isUnhealthy == unhealthy;
+                })
+                .toList();
+        Page<AiModel> source = new Page<>(currentPage, pageSize);
+        long from = (long) (currentPage - 1) * pageSize;
+        int to = (int) Math.min(from + pageSize, matched.size());
+        source.setRecords(from >= matched.size() ? List.of() : matched.subList((int) from, to));
+        source.setTotal(matched.size());
+        return MPPageUtil.convertToPage(source, new Page<>(), AiModelDto.class);
+    }
+
+    public void disable(Long id) {
+        AiModel model = new AiModel();
+        model.setId(id);
+        model.setIsEnable(false);
+        baseMapper.updateById(model);
+    }
+
+    public void enable(Long id) {
+        AiModel model = new AiModel();
+        model.setId(id);
+        model.setIsEnable(true);
+        baseMapper.updateById(model);
+    }
+
+    public List<AiModelDto> listEnable() {
+        List<AiModel> aiModels = ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(AiModel::getIsEnable, true)
+                .eq(AiModel::getIsDeleted, false)
+                .list();
+        return MPPageUtil.convertToList(aiModels, AiModelDto.class);
+    }
+
+    public AiModelDto addOne(AiModelDto aiModelDto) {
+        Long count = ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(AiModel::getName, aiModelDto.getName())
+                .eq(AiModel::getPlatform, aiModelDto.getPlatform())
+                .eq(AiModel::getIsDeleted, false)
+                .count();
+        if (count > 0) {
+            throw new BaseException(ErrorEnum.A_MODEL_ALREADY_EXIST);
+        }
+        AiModel aiModel = new AiModel();
+        aiModelDto.setName(aiModelDto.getName().strip());
+        aiModelDto.setTitle(aiModelDto.getTitle().strip());
+        BeanUtils.copyProperties(aiModelDto, aiModel);
+        baseMapper.insert(aiModel);
+
+        AiModelDto result = new AiModelDto();
+        BeanUtils.copyProperties(aiModel, result);
+
+        aiModelInitializer.addOrUpdate(aiModel);
+
+        return result;
+    }
+
+    public void edit(AiModelDto aiModelDto) {
+// Add null check to prevent NPE when calling strip() during partial update (null fields)
+        // 增加非空判断，防止部分更新（字段为null）时调用 strip() 报空指针异常
+        if (StringUtils.isNotBlank(aiModelDto.getName())) {
+            aiModelDto.setName(aiModelDto.getName().strip());
+        }
+        if (StringUtils.isNotBlank(aiModelDto.getTitle())) {
+            aiModelDto.setTitle(aiModelDto.getTitle().strip());
+        }
+
+        AiModel oldAiModel = getByIdOrThrow(aiModelDto.getId());
+
+        AiModel aiModel = new AiModel();
+// Copy properties, null values are also copied
+        // 复制属性，null 值也会被复制，但 MyBatis-Plus updateById 默认策略通常忽略 null 值（SELECTIVE）
+// Thus achieving the effect of updating only the isFree field
+        // 从而实现只更新 isFree 字段的效果
+        BeanUtils.copyProperties(aiModelDto, aiModel, "createTime", "updateTime");
+        baseMapper.updateById(aiModel);
+
+        AiModel updatedOne = getByIdOrThrow(aiModelDto.getId());
+        aiModelInitializer.delete(oldAiModel);
+        aiModelInitializer.addOrUpdate(updatedOne);
+    }
+
+    public void softDelete(Long id) {
+        AiModel existModel = getByIdOrThrow(id);
+
+        AiModel model = new AiModel();
+        model.setId(id);
+        model.setIsDeleted(true);
+        baseMapper.updateById(model);
+
+        aiModelInitializer.delete(existModel);
+    }
+}

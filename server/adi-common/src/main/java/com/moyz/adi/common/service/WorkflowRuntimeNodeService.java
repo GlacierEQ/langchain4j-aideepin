@@ -1,0 +1,157 @@
+package com.moyz.adi.common.service;
+
+import com.baomidou.mybatisplus.spring.service.impl.ServiceImpl;
+import com.baomidou.mybatisplus.extension.toolkit.ChainWrappers;
+import tools.jackson.databind.node.ObjectNode;
+import com.moyz.adi.common.base.ThreadContext;
+import com.moyz.adi.common.dto.workflow.WfRuntimeNodeDto;
+import com.moyz.adi.common.entity.User;
+import com.moyz.adi.common.entity.WorkflowRuntime;
+import com.moyz.adi.common.entity.WorkflowRuntimeNode;
+import com.moyz.adi.common.mapper.WorkflowRuntimeNodeMapper;
+import com.moyz.adi.common.util.JsonUtil;
+import com.moyz.adi.common.util.MPPageUtil;
+import com.moyz.adi.common.util.PrivilegeUtil;
+import com.moyz.adi.common.util.NumberUtil;
+import com.moyz.adi.common.workflow.WfNodeState;
+import com.moyz.adi.common.workflow.data.NodeIOData;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.BeanUtils;
+import org.springframework.stereotype.Service;
+import org.springframework.util.CollectionUtils;
+
+import java.util.List;
+
+import static com.moyz.adi.common.enums.ErrorEnum.A_AI_IMAGE_NOT_FOUND;
+
+@Slf4j
+@Service
+public class WorkflowRuntimeNodeService extends ServiceImpl<WorkflowRuntimeNodeMapper, WorkflowRuntimeNode> {
+
+
+    public List<WfRuntimeNodeDto> listByWfRuntimeId(long runtimeId) {
+        List<WorkflowRuntimeNode> workflowNodeList = ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(!ThreadContext.getCurrentUser().getIsAdmin(), WorkflowRuntimeNode::getUserId, ThreadContext.getCurrentUser().getId())
+                .eq(WorkflowRuntimeNode::getWorkflowRuntimeId, runtimeId)
+                .eq(WorkflowRuntimeNode::getIsDeleted, false)
+                .orderByAsc(WorkflowRuntimeNode::getId)
+                .list();
+        List<WfRuntimeNodeDto> result = MPPageUtil.convertToList(workflowNodeList, WfRuntimeNodeDto.class);
+        for (WfRuntimeNodeDto dto : result) {
+            fillInputOutput(dto);
+        }
+        return result;
+    }
+
+    /**
+     * Same rows as {@link #listByWfRuntimeId} but without the ThreadContext ownership filter —
+     * the resume continuation runs on an @Async thread where ThreadContext is absent,
+     * and the runtime's ownership was already enforced on the request thread (getForResume).
+     * Ordered by id so the replayed completedNodes list keeps execution order.
+     * resume 重建专用：@Async 线程无 ThreadContext，所有者已在请求线程校验过；按 id 升序保持执行顺序。
+     */
+    public List<WfRuntimeNodeDto> listByRuntimeIdForResume(long runtimeId) {
+        List<WorkflowRuntimeNode> workflowNodeList = ChainWrappers.lambdaQueryChain(baseMapper)
+                .eq(WorkflowRuntimeNode::getWorkflowRuntimeId, runtimeId)
+                .eq(WorkflowRuntimeNode::getIsDeleted, false)
+                .orderByAsc(WorkflowRuntimeNode::getId)
+                .list();
+        List<WfRuntimeNodeDto> result = MPPageUtil.convertToList(workflowNodeList, WfRuntimeNodeDto.class);
+        for (WfRuntimeNodeDto dto : result) {
+            fillInputOutput(dto);
+        }
+        return result;
+    }
+
+    /**
+     * 按运行 id 集合批量取节点实体（一次查询），供运行删除后的引用重算读取 input/output；
+     * 调用方的运行集合已完成所有者过滤，此处不再按 ThreadContext 过滤。
+     * <p>
+     * Batch-load node entities by runtime ids in one query, for the post-delete reference recount
+     * to read input/output; the caller's runtime set is already ownership-scoped, so no
+     * ThreadContext filter is applied here.
+     * </p>
+     */
+    public List<WorkflowRuntimeNode> listByRuntimeIds(List<Long> runtimeIds) {
+        if (CollectionUtils.isEmpty(runtimeIds)) {
+            return List.of();
+        }
+        return ChainWrappers.lambdaQueryChain(baseMapper)
+                .in(WorkflowRuntimeNode::getWorkflowRuntimeId, runtimeIds)
+                .eq(WorkflowRuntimeNode::getIsDeleted, false)
+                .list();
+    }
+
+    public WfRuntimeNodeDto createByState(User user, long wfNodeId, long wfRuntimeId, WfNodeState state) {
+        WorkflowRuntimeNode runtimeNode = new WorkflowRuntimeNode();
+        runtimeNode.setUuid(state.getUuid());
+        runtimeNode.setWorkflowRuntimeId(wfRuntimeId);
+        runtimeNode.setStatus(state.getProcessStatus());
+        runtimeNode.setUserId(user.getId());
+        runtimeNode.setNodeId(wfNodeId);
+        baseMapper.insert(runtimeNode);
+        runtimeNode = baseMapper.selectById(runtimeNode.getId());
+
+        WfRuntimeNodeDto result = new WfRuntimeNodeDto();
+        BeanUtils.copyProperties(runtimeNode, result);
+        fillInputOutput(result);
+        return result;
+    }
+
+    public void updateInput(Long id, WfNodeState state) {
+        if (CollectionUtils.isEmpty(state.getInputs())) {
+            log.warn("No input data, id:{}", id);
+            return;
+        }
+        WorkflowRuntimeNode node = baseMapper.selectById(id);
+        if (null == node) {
+            log.error("Node instance not found, id:{}", id);
+            return;
+        }
+        WorkflowRuntimeNode updateOne = new WorkflowRuntimeNode();
+        updateOne.setId(id);
+        ObjectNode ob = JsonUtil.createObjectNode();
+        for (NodeIOData data : state.getInputs()) {
+            ob.set(data.getName(), JsonUtil.classToJsonNode(data.getContent()));
+        }
+        updateOne.setInput(ob);
+        updateOne.setStatus(state.getProcessStatus());
+        updateOne.setStatusRemark(state.getProcessStatusRemark());
+        baseMapper.updateById(updateOne);
+    }
+
+    public void updateOutput(Long id, WfNodeState state) {
+        WorkflowRuntimeNode node = baseMapper.selectById(id);
+        if (null == node) {
+            log.error("Node instance not found, id:{}", id);
+            return;
+        }
+        WorkflowRuntimeNode updateOne = new WorkflowRuntimeNode();
+        updateOne.setId(id);
+        if (!CollectionUtils.isEmpty(state.getOutputs())) {
+            ObjectNode ob = JsonUtil.createObjectNode();
+            for (NodeIOData data : state.getOutputs()) {
+                ob.set(data.getName(), JsonUtil.classToJsonNode(data.getContent()));
+            }
+            updateOne.setOutput(ob);
+        }
+        updateOne.setStatus(state.getProcessStatus());
+        updateOne.setStatusRemark(state.getProcessStatusRemark());
+        //Persist metrics whenever present; a durationMs-only guard would drop sub-millisecond or cache-hit token info
+        if (state.getMetrics() != null) {
+            updateOne.setDuration(NumberUtil.saturatedCastToInt(state.getMetrics().getDurationMs()));
+            updateOne.setMetadata(state.getMetrics());
+        }
+        baseMapper.updateById(updateOne);
+    }
+
+    private void fillInputOutput(WfRuntimeNodeDto dto) {
+        if (null == dto.getInput()) {
+            dto.setInput(JsonUtil.createObjectNode());
+        }
+        if (null == dto.getOutput()) {
+            dto.setOutput(JsonUtil.createObjectNode());
+        }
+    }
+
+}
